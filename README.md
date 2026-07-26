@@ -25,7 +25,7 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 <tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>
 <tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. FTS5 session search with LLM summarization for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
 <tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
-<tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
+<tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams — each optionally routed to a <a href="#named-profiles-for-subagents">named Hermes profile</a> (dedicated provider, model, credentials, and SOUL.md identity). Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
 <tr><td><b>Runs anywhere, not just your laptop</b></td><td>Six terminal backends — local, Docker, SSH, Singularity, Modal, and Daytona. Daytona and Modal offer serverless persistence — your agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions. Run it on a $5 VPS or a GPU cluster.</td></tr>
 <tr><td><b>Research-ready</b></td><td>Batch trajectory generation, trajectory compression for training the next generation of tool-calling models.</td></tr>
 </table>
@@ -211,6 +211,42 @@ What gets imported:
 - **Workspace instructions** — AGENTS.md (with `--workspace-target`)
 
 See `hermes claw migrate --help` for all options, or use the `openclaw-migration` skill for an interactive agent-guided migration with dry-run previews.
+
+---
+
+## Named Profiles for Subagents
+
+Each `delegate_task` call can target a named Hermes profile — a separate configuration directory under `~/.hermes/profiles/<name>/` with its own `config.yaml`, `.env` secrets, and `SOUL.md` identity.
+
+```python
+# Ask the agent to delegate a sub-task to the "analyst" profile
+delegate_task(
+    goal="Summarise the quarterly revenue data",
+    profile="analyst",          # routes to ~/.hermes/profiles/analyst/
+)
+
+# Batch — each task can use a different profile
+delegate_task(tasks=[
+    {"goal": "Draft the investor memo",   "profile": "writer"},
+    {"goal": "Run the financial model",   "profile": "analyst"},
+])
+```
+
+**What the profile controls:**
+
+| Setting | Source |
+|---------|--------|
+| Provider / model / base URL / API key | `~/.hermes/profiles/<name>/config.yaml` |
+| Secrets (e.g. `HERMES_INFERENCE_API_KEY`) | `~/.hermes/profiles/<name>/.env` |
+| Agent identity | `~/.hermes/profiles/<name>/SOUL.md` |
+
+**Isolation guarantees:**
+- The profile's `HERMES_HOME` and secret scope are applied context-locally and always restored, even on partial failure.
+- The child agent never inherits the parent's ACP transport or credentials when `profile=` is set.
+- Toolset bounds are still enforced — a profile cannot grant a child more tools than the parent.
+- Falls back to parent-inherited provider/model when `profile` is omitted (no behaviour change for existing calls).
+
+Create a profile with `hermes profile create <name>`, then pick its model with `hermes model`.
 
 ---
 
