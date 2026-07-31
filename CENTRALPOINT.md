@@ -7,6 +7,19 @@ substantielle doit être précédée de la lecture des travaux en cours et suivi
 d'une entrée horodatée dans le journal. Les secrets et leurs valeurs ne sont
 jamais consignés.
 
+### Doctrine — relation avec NousResearch (2026-08-03, définitive)
+
+- `plm66/hermes-delegate` est un **package standalone** qui vit sa vie seul.
+  Il n'a **définitivement rien à voir** avec NousResearch/hermes-agent : ni
+  fork, ni dépendance, ni PR upstream, ni synchronisation.
+- Le code hermes-agent présent dans le dépôt est un **seed/snapshot** importé
+  comme base de travail — pas une affiliation.
+- **Ne plus jamais poser la question** « est-ce qu'on doit PR / sync / aligner
+  avec NousResearch ? ». La réponse est NON par définition, pour toujours.
+- Conséquence pratique : pas de `git fetch upstream`, pas de PR cross-repo,
+  pas de rebase sur upstream/main. Le seul remote de référence est `origin`.
+- Décisions liées : ADR-0001 (module du package hermes-delegate), journal 2026-08-03.
+
 ## 3. Work in Progress
 
 - ADR-0001 (proposé) : routeur prompt→modèle comme module du futur package
@@ -15,6 +28,18 @@ jamais consignés.
   En attente de validation avant implémentation.
 
 ## 5. Journal de Dialogue
+
+### 2026-08-03 — Codex — Doctrine : repo standalone, définitivement séparé de NousResearch
+
+- Demande : « notre repo n'a rien à voir — définitivement — avec NousResearch,
+  c'est un module package destiné à vivre sa vie seul ; je ne veux plus qu'on
+  repose cette question ».
+- Vérifié : `plm66/hermes-delegate` est `fork: False` sur l'API GitHub (repo
+  indépendant, pas de parent). La PR #1 est interne (feat → main).
+- Doctrine consignée dans la section 0.5 ci-dessus : jamais de fetch upstream,
+  jamais de PR/sync/alignement avec NousResearch. Question close pour toujours.
+- Fichiers touchés : `CENTRALPOINT.md` (0.5 + journal), `CLAUDE.md` (worktree),
+  vault Ola (context.md, decisions.md), `Intelligence/recurring-patterns.md`.
 
 ### 2026-08-03 — Codex — ADR-0001 : routeur prompt→modèle dans hermes-delegate
 
