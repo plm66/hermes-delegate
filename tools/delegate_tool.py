@@ -1086,6 +1086,9 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Hermes profile name to use for credential resolution.
+    # When set, overrides the delegation config's provider:model.
+    profile: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1258,6 +1261,48 @@ def _build_child_agent(
         effective_api_mode = None  # force re-derivation from provider's defaults
     else:
         effective_api_mode = getattr(parent_agent, "api_mode", None)
+
+    effective_request_overrides = override_request_overrides
+    # Profile-based credential override: when a named profile is provided,
+    # its credentials (provider, model, api_key, base_url) beat both the
+    # delegation config and parent inheritance. This lets users route a
+    # subagent to an entirely different provider:model pair by profile name.
+    if profile:
+        try:
+            _profile_creds = _resolve_profile_config(profile)
+        except ValueError as exc:
+            # Fail-closed: an explicit profile that cannot be resolved must
+            # abort the child build — never fall back to parent/default
+            # credentials, which would silently run outside the profile.
+            logger.warning("Profile '%s' resolution failed: %s", profile, exc)
+            raise RuntimeError(
+                f"Cannot build subagent for profile '{profile}': {exc}"
+            ) from exc
+        else:
+            # Fail-closed: when profile is provided, model and provider
+            # MUST come from the profile — never inherit from parent.
+            _p_model = _profile_creds.get("model")
+            _p_provider = _profile_creds.get("provider")
+            if not _p_model or not _p_provider:
+                raise RuntimeError(
+                    f"Profile '{profile}' resolved but returned incomplete "
+                    f"credentials (model={_p_model!r}, provider={_p_provider!r})."
+                )
+            effective_model = _p_model
+            effective_provider = _p_provider
+            if _profile_creds.get("base_url"):
+                effective_base_url = _profile_creds["base_url"]
+            if _profile_creds.get("api_key"):
+                effective_api_key = _profile_creds["api_key"]
+            if _profile_creds.get("api_mode"):
+                effective_api_mode = _profile_creds["api_mode"]
+            if _profile_creds.get("max_output_tokens"):
+                override_max_tokens = _profile_creds["max_output_tokens"]
+            if _profile_creds.get("request_overrides"):
+                effective_request_overrides = _profile_creds["request_overrides"]
+            # NOTE: ACP transport neutralization is applied AFTER the common
+            # inheritance block below — see "Profile forces direct API".
+
     # Defensive: validate trusted delegation.command exists on PATH before
     # honoring it. Stale config should not force a child onto the ACP transport
     # and then fail at subprocess startup.
@@ -1272,6 +1317,10 @@ def _build_child_agent(
             )
             override_acp_command = None
             override_acp_args = None
+    # ACP transport resolution: an explicit delegation.command override beats
+    # parent inheritance. This common assignment MUST run before the
+    # provider/profile neutralizations below so those rules have the final
+    # word on the value actually passed to the child.
     effective_acp_command = override_acp_command or getattr(
         parent_agent, "acp_command", None
     )
@@ -1281,17 +1330,27 @@ def _build_child_agent(
         else (getattr(parent_agent, "acp_args", []) or [])
     )
 
-    # When override_provider is set (e.g. delegation.provider: minimax-cn),
-    # the subagent must use direct API calls — not the parent's ACP transport.
-    # Inheriting acp_command unconditionally causes run_agent.py to initialize
-    # CopilotACPClient, bypassing override credentials entirely (issue #16816).
-    if override_provider and not override_acp_command:
+    if profile:
+        # Profile forces direct API: its credentials route the child to a
+        # different provider:model pair, so no ACP transport may leak through
+        # — neither the parent's acp_command/acp_args nor the delegation
+        # config's command override. Otherwise run_agent.py initializes
+        # CopilotACPClient and the profile routing is bypassed entirely.
+        effective_acp_command = None
+        effective_acp_args = []
+    elif override_provider and not override_acp_command:
+        # When override_provider is set (e.g. delegation.provider: minimax-cn),
+        # the subagent must use direct API calls — not the parent's ACP transport.
+        # Inheriting acp_command unconditionally causes run_agent.py to initialize
+        # CopilotACPClient, bypassing override credentials entirely (issue #16816).
         effective_acp_command = None
         effective_acp_args = []
 
-    if override_acp_command:
+    if override_acp_command and not profile:
         # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
-        # so run_agent.py initializes the CopilotACPClient.
+        # so run_agent.py initializes the CopilotACPClient. Skipped when a
+        # profile is active: the profile's provider routing wins over the
+        # delegation config's command (profile > delegation config > parent).
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
@@ -1341,7 +1400,7 @@ def _build_child_agent(
         parent_agent, "provider_data_collection", None
     ) or ""
     child_openrouter_min_coding_score = getattr(parent_agent, "openrouter_min_coding_score", None)
-    if override_provider:
+    if override_provider or profile:
         child_providers_allowed = None
         child_providers_ignored = None
         child_providers_order = None
@@ -1361,50 +1420,102 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
-    from agent.delegation_context import delegated_child_context
+    # Setup context if profile is provided
+    home_token = None
+    secret_token = None
+    try:
+        if profile:
+            from hermes_cli.profiles import get_profile_dir
+            from hermes_constants import (
+                reset_hermes_home_override,
+                set_hermes_home_override,
+            )
+            from agent.secret_scope import (
+                build_profile_secret_scope,
+                reset_secret_scope,
+                set_secret_scope,
+            )
 
-    with delegated_child_context():
-        child = AIAgent(
-            base_url=effective_base_url,
-            api_key=effective_api_key,
-            model=effective_model,
-            provider=effective_provider,
-            api_mode=effective_api_mode,
-            acp_command=effective_acp_command,
-            acp_args=effective_acp_args,
-            max_iterations=max_iterations,
+            try:
+                profile_dir = get_profile_dir(profile)
+                home_token = set_hermes_home_override(str(profile_dir))
+                secrets_map = build_profile_secret_scope(profile_dir)
+                secret_token = set_secret_scope(secrets_map)
+            except Exception as exc:
+                # Fail-closed AND leak-free: roll back any partially-acquired
+                # scope token before aborting — otherwise a failure after
+                # set_hermes_home_override() would pin the parent thread to
+                # the profile's HERMES_HOME (and leak it to later batch tasks).
+                if secret_token is not None:
+                    reset_secret_scope(secret_token)
+                    secret_token = None
+                if home_token is not None:
+                    reset_hermes_home_override(home_token)
+                    home_token = None
+                raise RuntimeError(
+                    f"Cannot isolate subagent context for profile '{profile}': {exc}"
+                ) from exc
 
-            reasoning_config=child_reasoning,
-            prefill_messages=getattr(parent_agent, "prefill_messages", None),
-            fallback_model=parent_fallback,
-            enabled_toolsets=child_toolsets,
-            disabled_toolsets=child_disabled_toolsets,
-            quiet_mode=True,
-            ephemeral_system_prompt=child_prompt,
-            log_prefix=f"[subagent-{task_index}]",
-            platform="subagent",
-            skip_context_files=True,
-            skip_memory=True,
-            clarify_callback=None,
-            thinking_callback=child_thinking_cb,
-            session_db=getattr(parent_agent, "_session_db", None),
-            parent_session_id=getattr(parent_agent, "session_id", None),
-            providers_allowed=child_providers_allowed,
-            providers_ignored=child_providers_ignored,
-            providers_order=child_providers_order,
-            provider_sort=child_provider_sort,
-            provider_require_parameters=child_provider_require_parameters,
-            provider_data_collection=child_provider_data_collection,
-            request_overrides=(
-                dict(override_request_overrides or {})
-                if override_provider
-                else dict(getattr(parent_agent, "request_overrides", {}) or {})
-            ),
-            openrouter_min_coding_score=child_openrouter_min_coding_score,
-            tool_progress_callback=child_progress_cb,
-            iteration_budget=None,  # fresh budget per subagent
-            **child_optional_kwargs,
-        )
+        from agent.delegation_context import delegated_child_context
+
+        with delegated_child_context():
+            child = AIAgent(
+                base_url=effective_base_url,
+                api_key=effective_api_key,
+                model=effective_model,
+                provider=effective_provider,
+                api_mode=effective_api_mode,
+                acp_command=effective_acp_command,
+                acp_args=effective_acp_args,
+                max_iterations=max_iterations,
+
+                reasoning_config=child_reasoning,
+                prefill_messages=getattr(parent_agent, "prefill_messages", None),
+                fallback_model=parent_fallback,
+                enabled_toolsets=child_toolsets,
+                disabled_toolsets=child_disabled_toolsets,
+                quiet_mode=True,
+                ephemeral_system_prompt=child_prompt,
+                log_prefix=f"[subagent-{task_index}]",
+                platform="subagent",
+                skip_context_files=True,
+                # A profile-routed child still loads its profile's SOUL.md as
+                # identity (from the scoped HERMES_HOME) even though project
+                # context files are skipped — see system_prompt.py.
+                load_soul_identity=bool(profile),
+                skip_memory=True,
+                clarify_callback=None,
+                thinking_callback=child_thinking_cb,
+                session_db=getattr(parent_agent, "_session_db", None),
+                parent_session_id=getattr(parent_agent, "session_id", None),
+                providers_allowed=child_providers_allowed,
+                providers_ignored=child_providers_ignored,
+                providers_order=child_providers_order,
+                provider_sort=child_provider_sort,
+                provider_require_parameters=child_provider_require_parameters,
+                provider_data_collection=child_provider_data_collection,
+                request_overrides=(
+                    dict(effective_request_overrides or {})
+                    if (override_provider or profile)
+                    else dict(getattr(parent_agent, "request_overrides", {}) or {})
+                ),
+                openrouter_min_coding_score=child_openrouter_min_coding_score,
+                tool_progress_callback=child_progress_cb,
+                iteration_budget=None,  # fresh budget per subagent
+                **child_optional_kwargs,
+            )
+            child._delegate_profile = profile
+    finally:
+        # Construction errors propagate with their original message (only
+        # scope-installation failures are re-labeled, in the dedicated scope
+        # block above). Partially-acquired tokens were already rolled back
+        # there; this restores the fully-installed scope on the happy path.
+        if secret_token:
+            from agent.secret_scope import reset_secret_scope
+            reset_secret_scope(secret_token)
+        if home_token:
+            from hermes_constants import reset_hermes_home_override
+            reset_hermes_home_override(home_token)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
@@ -1926,6 +2037,7 @@ def _run_single_child(
                 "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
                 "depth": _tui_depth,
                 "goal": goal,
+                "profile": getattr(child, "_delegate_profile", None),
                 "model": (
                     getattr(child, "model", None)
                     if isinstance(getattr(child, "model", None), str)
@@ -2006,13 +2118,49 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+            from agent.secret_scope import set_secret_scope, reset_secret_scope, build_profile_secret_scope
+            from hermes_cli.profiles import get_profile_dir
 
-            with delegated_child_context():
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+            _profile = getattr(child, "_delegate_profile", None)
+            home_token = None
+            secret_token = None
+            try:
+                if _profile:
+                    try:
+                        profile_dir = get_profile_dir(_profile)
+                        home_token = set_hermes_home_override(str(profile_dir))
+                        secrets_map = build_profile_secret_scope(profile_dir)
+                        secret_token = set_secret_scope(secrets_map)
+                    except Exception as exc:
+                        # Fail-closed AND leak-free: roll back any partially-
+                        # acquired scope token before aborting — the executor
+                        # may reuse this worker thread for later tasks, so the
+                        # profile's HERMES_HOME must not linger here.
+                        if secret_token is not None:
+                            reset_secret_scope(secret_token)
+                            secret_token = None
+                        if home_token is not None:
+                            reset_hermes_home_override(home_token)
+                            home_token = None
+                        raise RuntimeError(
+                            f"Cannot isolate subagent context for profile "
+                            f"'{_profile}': {exc}"
+                        ) from exc
+
+                with delegated_child_context():
+                    return child.run_conversation(
+                        user_message=goal,
+                        task_id=child_task_id,
+                        stream_callback=_relay_child_text,
+                    )
+            finally:
+                # run_conversation errors propagate with their original
+                # message (only scope failures are re-labeled, above).
+                if secret_token:
+                    reset_secret_scope(secret_token)
+                if home_token:
+                    reset_hermes_home_override(home_token)
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
@@ -2108,6 +2256,7 @@ def _run_single_child(
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
+                "profile": getattr(child, "_delegate_profile", None),
                 "diagnostic_path": diagnostic_path,
             }
         finally:
@@ -2203,6 +2352,7 @@ def _run_single_child(
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
+            "profile": getattr(child, "_delegate_profile", None),
             "tokens": {
                 "input": (
                     _input_tokens if isinstance(_input_tokens, (int, float)) else 0
@@ -2351,6 +2501,7 @@ def _run_single_child(
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
+            "profile": getattr(child, "_delegate_profile", None),
         }
 
     finally:
@@ -2435,6 +2586,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    profile: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2538,14 +2690,14 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [{"goal": goal, "context": context, "role": top_role, "profile": profile}]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
     if not task_list:
         return tool_error("No tasks provided.")
 
-    # Validate each task has a goal
+    # Validate each task has a goal and profiles are valid
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(
@@ -2553,6 +2705,25 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        task_profile = task.get("profile") or profile
+        if task_profile:
+            try:
+                from hermes_cli.profiles import (
+                    validate_profile_name,
+                    get_profile_dir,
+                    normalize_profile_name,
+                )
+                canon = normalize_profile_name(task_profile)
+                validate_profile_name(canon)
+                if canon != "default" and not get_profile_dir(canon).is_dir():
+                    return tool_error(
+                        f"Profile '{task_profile}' does not exist. "
+                        f"Create it with: hermes profile create {task_profile}"
+                    )
+            except ValueError as exc:
+                return tool_error(
+                    f"Task {i}: invalid profile '{task_profile}': {exc}"
+                )
 
     overall_start = time.monotonic()
     results = []
@@ -2599,32 +2770,57 @@ def delegate_task(
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
+    build_failures: List[Dict[str, Any]] = []
     try:
         for i, t in enumerate(task_list):
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
-            child = _build_child_agent(
-                task_index=i,
-                goal=t["goal"],
-                context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
-                model=creds["model"],
-                max_iterations=effective_max_iter,
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
-                role=effective_role,
-            )
+            # Per-task profile beats top-level.
+            effective_profile = t.get("profile") or profile
+            try:
+                child = _build_child_agent(
+                    task_index=i,
+                    goal=t["goal"],
+                    context=t.get("context"),
+                    # Subagents always inherit the parent's toolsets; the model
+                    # cannot choose or narrow them (no model-facing toolsets arg).
+                    toolsets=None,
+                    model=creds["model"],
+                    max_iterations=effective_max_iter,
+                    task_count=n_tasks,
+                    parent_agent=parent_agent,
+                    override_provider=creds["provider"],
+                    override_base_url=creds["base_url"],
+                    override_api_key=creds["api_key"],
+                    override_api_mode=creds["api_mode"],
+                    override_request_overrides=creds.get("request_overrides"),
+                    override_max_tokens=creds.get("max_output_tokens"),
+                    override_acp_command=creds.get("command"),
+                    override_acp_args=creds.get("args"),
+                    role=effective_role,
+                    profile=effective_profile,
+                )
+            except Exception as exc:
+                # Fail-closed per task: a child that cannot be built (e.g.
+                # profile resolution or context-isolation failure) becomes an
+                # error entry — it never runs with parent credentials, and
+                # the rest of the batch still proceeds.
+                logger.warning("Subagent %d build failed: %s", i, exc)
+                build_failures.append(
+                    {
+                        "task_index": i,
+                        "status": "error",
+                        "summary": None,
+                        "error": f"Subagent build failed: {exc}",
+                        "exit_reason": "error",
+                        "api_calls": 0,
+                        "duration_seconds": 0,
+                        "_child_role": effective_role,
+                        "profile": effective_profile,
+                    }
+                )
+                continue
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             # Tee the child's progress events into its live transcript log.
@@ -2653,11 +2849,18 @@ def delegate_task(
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
         """
+        # Children that failed to build are already-terminal error entries —
+        # merge them so they land in the final sorted results. Child agents
+        # must be looked up by task_index: the children list is no longer
+        # aligned with task indices once a build failure skips one.
+        results.extend(build_failures)
+        _child_by_task_index = {i: child for (i, _, child) in children}
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
-            _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
-            results.append(result)
+            if children:
+                _i, _t, child = children[0]
+                result = _run_single_child(_i, _t["goal"], child, parent_agent)
+                results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
             completed_count = 0
@@ -2710,6 +2913,7 @@ def delegate_task(
                                         "_child_role": getattr(
                                             _child_by_index.get(idx), "_delegate_role", None
                                         ),
+                                        "profile": getattr(_child_by_index.get(idx), "_delegate_profile", None),
                                     }
                             else:
                                 entry = {
@@ -2722,6 +2926,7 @@ def delegate_task(
                                     "_child_role": getattr(
                                         _child_by_index.get(idx), "_delegate_role", None
                                     ),
+                                    "profile": getattr(_child_by_index.get(idx), "_delegate_profile", None),
                                 }
                             results.append(entry)
                             completed_count += 1
@@ -2747,6 +2952,7 @@ def delegate_task(
                                 "_child_role": getattr(
                                     _child_by_index.get(idx), "_delegate_role", None
                                 ),
+                                "profile": getattr(_child_by_index.get(idx), "_delegate_profile", None),
                             }
                         results.append(entry)
                         completed_count += 1
@@ -2803,10 +3009,10 @@ def delegate_task(
                     parent_agent._memory_manager.on_delegation(
                         task=_task_goal,
                         result=entry.get("summary", "") or "",
-                        child_session_id=(
-                            getattr(children[entry["task_index"]][2], "session_id", "")
-                            if entry["task_index"] < len(children)
-                            else ""
+                        child_session_id=getattr(
+                            _child_by_task_index.get(entry["task_index"]),
+                            "session_id",
+                            "",
                         ),
                     )
                 except Exception:
@@ -2840,12 +3046,7 @@ def delegate_task(
             if _invoke_hook is None:
                 continue
             try:
-                _child_index = entry.get("task_index", -1)
-                _child_agent = (
-                    children[_child_index][2]
-                    if isinstance(_child_index, int) and 0 <= _child_index < len(children)
-                    else None
-                )
+                _child_agent = _child_by_task_index.get(entry.get("task_index", -1))
                 _invoke_hook(
                     "subagent_stop",
                     parent_session_id=_parent_session_id,
@@ -3327,6 +3528,118 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _resolve_profile_config(profile_name: str) -> dict:
+    """Resolve a Hermes profile name to a credential bundle.
+
+    Loads the profile's ``config.yaml`` from ``~/.hermes/profiles/<name>/``,
+    extracts the ``model.*`` section, and resolves the provider:model pair
+    through the same ``resolve_runtime_provider()`` path used by delegation
+    config and CLI startup.  Returns the same dict shape as
+    ``_resolve_delegation_credentials()`` so the caller can treat both sources
+    identically.
+
+    Raises ValueError if the profile doesn't exist or its config is invalid.
+    """
+    try:
+        from hermes_cli.profiles import get_profile_dir
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot resolve profile '{profile_name}': "
+            f"hermes_cli.profiles module unavailable: {exc}"
+        ) from exc
+
+    profile_dir = get_profile_dir(profile_name)
+    if profile_name != "default" and not profile_dir.is_dir():
+        raise ValueError(
+            f"Profile '{profile_name}' not found at {profile_dir}. "
+            f"Create it with: hermes profile create {profile_name}"
+        )
+
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from agent.secret_scope import set_secret_scope, reset_secret_scope, build_profile_secret_scope
+    from hermes_cli.config import load_config
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    home_token = set_hermes_home_override(str(profile_dir))
+    secret_token = None
+    try:
+        # Load profile-scoped secrets. A profile without its own .env or
+        # secrets file returns an empty scope — that's normal, not an error.
+        # Only actual resolution failures (corrupt file, permission denied)
+        # are raised as ValueError to keep the function fail-closed.
+        try:
+            secrets_map = build_profile_secret_scope(profile_dir)
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot build secret scope for profile "
+                f"'{profile_name}': {exc}"
+            ) from exc
+        if secrets_map:
+            try:
+                secret_token = set_secret_scope(secrets_map)
+            except Exception as exc:
+                raise ValueError(
+                    f"Cannot activate secret scope for profile "
+                    f"'{profile_name}': {exc}"
+                ) from exc
+
+        cfg = load_config()
+        model_cfg = cfg.get("model") or {}
+        configured_model = str(model_cfg.get("default") or "").strip() or None
+        configured_provider = str(model_cfg.get("provider") or "").strip() or None
+
+        if not configured_provider:
+            raise ValueError(
+                f"Profile '{profile_name}' has no model.provider in config.yaml"
+            )
+        if not configured_model:
+            raise ValueError(
+                f"Profile '{profile_name}' has no model.default in config.yaml"
+            )
+
+        # Resolve full credentials via the runtime provider system.
+        try:
+            runtime = resolve_runtime_provider(
+                requested=configured_provider, target_model=configured_model
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot resolve provider '{configured_provider}' for "
+                f"profile '{profile_name}': {exc}. "
+                f"Check that the provider is configured (API key set, valid name)."
+            ) from exc
+
+        api_key = runtime.get("api_key", "")
+        if not api_key:
+            raise ValueError(
+                f"Profile '{profile_name}' resolved provider "
+                f"'{configured_provider}' but has no API key. "
+                f"Set the appropriate environment variable or run 'hermes auth'."
+            )
+
+        effective_provider = (
+            configured_provider
+            if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM
+            else runtime.get("provider")
+        )
+
+        return {
+            "model": configured_model,
+            "provider": effective_provider,
+            "base_url": runtime.get("base_url"),
+            "api_key": api_key,
+            "api_mode": runtime.get("api_mode"),
+            "request_overrides": dict(runtime.get("request_overrides") or {}),
+            "max_output_tokens": runtime.get("max_output_tokens"),
+            "command": runtime.get("command"),
+            "args": list(runtime.get("args") or []),
+        }
+    finally:
+        if secret_token:
+            reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
 def _load_config() -> dict:
     """Load delegation config from the active Hermes config.
 
@@ -3475,7 +3788,7 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Subagent provider/model can be selected per call via the 'profile' parameter (which loads the named profile's config.yaml and credentials). Without a profile, children inherit the parent model (plus its fallback chain) unless you pin all subagents via delegation.provider / delegation.model in config.yaml.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3604,6 +3917,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "profile": {
+                            "type": "string",
+                            "description": "Per-task profile override. Beats the top-level profile. Same validation rules apply.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3616,6 +3933,19 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Optional Hermes profile name for the subagent(s). "
+                    "When set, the subagent runs with the model, provider, and "
+                    "credentials from that profile's config.yaml instead of "
+                    "inheriting from the parent. Per-task profile beats the "
+                    "top-level one. Named profiles live under "
+                    "~/.hermes/profiles/<name>/; the built-in \"default\" "
+                    "profile is also valid. Invalid, reserved, or non-existent "
+                    "profile names are rejected with a clear error."
+                ),
             },
             "background": {
                 "type": "boolean",
@@ -3688,6 +4018,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        profile=args.get("profile"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),

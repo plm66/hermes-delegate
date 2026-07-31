@@ -10,11 +10,13 @@ Run with:  python -m pytest tests/test_delegate.py -v
 """
 
 import json
+import inspect
 import os
 import threading
 import time
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -3255,6 +3257,923 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+
+class TestProfileParam(unittest.TestCase):
+    """TDD: RED tests for the `profile` parameter on delegate_task.
+
+    These tests define the contract BEFORE any implementation code is written.
+    All will fail until the implementation is added.
+    """
+
+    # ── Schema tests ──────────────────────────────────────────────────────
+
+    def test_schema_exposes_profile_top_level(self):
+        """DELEGATE_TASK_SCHEMA must include an optional `profile` property."""
+        self.assertIn("profile", DELEGATE_TASK_SCHEMA["parameters"]["properties"])
+
+    def test_schema_exposes_profile_per_task(self):
+        """Each task in the `tasks` array must include an optional `profile`."""
+        task_props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"]
+        self.assertIn("profile", task_props)
+
+    def test_schema_profile_is_optional_string(self):
+        """`profile` must be an optional string (no required list change)."""
+        self.assertNotIn("profile", DELEGATE_TASK_SCHEMA["parameters"]["required"])
+        prop = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["profile"]
+        self.assertEqual(prop["type"], "string")
+
+    # ── Dispatch tests ────────────────────────────────────────────────────
+
+    def test_dispatch_passes_profile_to_delegate_task(self):
+        """_dispatch_delegate_task must pass `profile` through from function_args.
+
+        Exercises the REAL dispatch method (same pattern as
+        test_model_acp_args_not_forwarded) — not just the schema.
+        """
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return json.dumps({"results": []})
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"goal": "test", "profile": "free"},
+            )
+
+        self.assertEqual(captured.get("profile"), "free")
+        self.assertEqual(captured.get("goal"), "test")
+        self.assertIs(captured.get("parent_agent"), parent)
+        # depth 0 (top-level agent) → background dispatch
+        self.assertTrue(captured.get("background"))
+
+    # ── delegate_task function tests ──────────────────────────────────────
+
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._resolve_profile_config")
+    @patch("run_agent.AIAgent")
+    @patch("pathlib.Path.is_dir", return_value=True)
+    def test_delegate_task_accepts_profile_single(self, mock_isdir, mock_agent, mock_resolve, mock_run):
+        """delegate_task must accept `profile` in single-task mode."""
+        mock_resolve.return_value = {
+            "provider": "nous", "model": "poolside/laguna-s-2.1:free",
+            "base_url": "https://inference-api.nousresearch.com/v1",
+            "api_key": "sk-test",
+            "api_mode": "chat_completions",
+        }
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed",
+            "summary": "Done!", "api_calls": 1, "duration_seconds": 1.0,
+        }
+        mock_agent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        result = json.loads(delegate_task(
+            goal="Profile task", profile="zoe", parent_agent=parent,
+        ))
+        self.assertIn("results", result)
+        # The call must not raise TypeError — profile is accepted
+        self.assertEqual(result["results"][0]["status"], "completed")
+
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._resolve_profile_config")
+    @patch("run_agent.AIAgent")
+    @patch("pathlib.Path.is_dir", return_value=True)
+    def test_delegate_task_accepts_profile_per_task(self, mock_isdir, mock_agent, mock_resolve, mock_run):
+        """delegate_task must accept per-task `profile` in batch mode."""
+        mock_resolve.return_value = {
+            "provider": "nous", "model": "poolside/laguna-s-2.1:free",
+            "base_url": "https://inference-api.nousresearch.com/v1",
+            "api_key": "sk-test",
+            "api_mode": "chat_completions",
+        }
+        mock_run.side_effect = [
+            {"task_index": 0, "status": "completed", "summary": "A", "api_calls": 1, "duration_seconds": 1.0},
+            {"task_index": 1, "status": "completed", "summary": "B", "api_calls": 1, "duration_seconds": 1.0},
+        ]
+        mock_agent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        tasks = [
+            {"goal": "Task A", "profile": "zoe"},
+            {"goal": "Task B", "profile": "hector"},
+        ]
+        result = json.loads(delegate_task(tasks=tasks, parent_agent=parent))
+        self.assertIn("results", result)
+        self.assertEqual(len(result["results"]), 2)
+
+    # ── _build_child_agent tests ──────────────────────────────────────────
+
+    def test_build_child_agent_accepts_profile_param(self):
+        """_build_child_agent must accept a `profile` string parameter."""
+        parent = _make_mock_parent(depth=0)
+        # Profile resolution is mocked: fail-closed resolution (RuntimeError on
+        # failure) must not make this signature-contract test depend on the
+        # machine's provider login state.
+        with patch("run_agent.AIAgent") as MockAgent, \
+             patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+            mock_resolve.return_value = {
+                "provider": "nous",
+                "model": "poolside/laguna-s-2.1:free",
+            }
+            MockAgent.return_value = MagicMock()
+            try:
+                _build_child_agent(
+                    task_index=0,
+                    goal="Profile build",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                    profile="free",
+                )
+            except TypeError as exc:
+                self.fail(f"_build_child_agent raised TypeError for profile=: {exc}")
+
+    def test_build_child_agent_propagates_profile_override(self):
+        """When profile="free" is given, _build_child_agent must resolve it
+        into override_provider/model and NOT raise."""
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent, \
+             patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+            mock_resolve.return_value = {
+                "provider": "nous",
+                "model": "poolside/laguna-s-2.1:free",
+            }
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Profile propagate",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                profile="free",
+            )
+            mock_resolve.assert_called_once_with("free")
+
+    def test_build_child_agent_no_profile_passes_none(self):
+        """Without profile, _build_child_agent must NOT call _resolve_profile_config."""
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent, \
+             patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="No profile",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+            mock_resolve.assert_not_called()
+
+
+class TestProfileContract(unittest.TestCase):
+    """Contract tests for profile validation, result metadata, and isolation.
+
+    These tests exercise the REAL delegate_task() path with minimal mocking
+    (only AIAgent to avoid real LLM calls, and filesystem for profile checks).
+    """
+
+    # ── Validation ────────────────────────────────────────────────────────
+
+    @patch("run_agent.AIAgent")
+    def test_validation_rejects_invalid_name(self, mock_agent):
+        """delegate_task must reject profile names that fail validate_profile_name."""
+        mock_agent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        result = json.loads(delegate_task(
+            goal="test", profile="../../etc", parent_agent=parent,
+        ))
+        self.assertIn("error", result)
+        self.assertIn("invalid profile", result["error"].lower())
+
+    @patch("run_agent.AIAgent")
+    def test_validation_rejects_reserved_name(self, mock_agent):
+        """delegate_task must reject reserved profile names like 'test'."""
+        mock_agent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        result = json.loads(delegate_task(
+            goal="test", profile="test", parent_agent=parent,
+        ))
+        self.assertIn("error", result)
+        self.assertIn("reserved", result["error"].lower())
+
+    @patch("pathlib.Path.is_dir")
+    @patch("run_agent.AIAgent")
+    def test_validation_rejects_nonexistent_profile(self, mock_agent, mock_isdir):
+        """delegate_task must reject valid profile names that don't exist on disk."""
+        mock_agent.return_value = MagicMock()
+        mock_isdir.return_value = False
+        parent = _make_mock_parent()
+        result = json.loads(delegate_task(
+            goal="test", profile="ghost", parent_agent=parent,
+        ))
+        self.assertIn("error", result)
+        self.assertIn("does not exist", result["error"].lower())
+
+    # ── Result metadata ───────────────────────────────────────────────────
+
+    @patch("run_agent.AIAgent")
+    @patch("pathlib.Path.is_dir", return_value=True)
+    def test_profile_in_success_result(self, mock_isdir, mock_agent):
+        """When profile is provided, the result dict should contain the profile name."""
+        mock_child = MagicMock()
+        mock_child.model = "claude-sonnet-4-6"
+        mock_child.session_prompt_tokens = 0
+        mock_child.session_completion_tokens = 0
+        mock_child.run_conversation.return_value = {
+            "final_response": "done", "completed": True, "interrupted": False,
+            "api_calls": 1, "messages": [],
+        }
+        mock_agent.return_value = mock_child
+
+        parent = _make_mock_parent()
+        with patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+            mock_resolve.return_value = {
+                "provider": "nous", "model": "poolside/laguna-s-2.1:free",
+                "base_url": "https://inference-api.nousresearch.com/v1",
+                "api_key": "sk-test",
+                "api_mode": "chat_completions",
+            }
+            result = json.loads(delegate_task(
+                goal="Check profile metadata", profile="free", parent_agent=parent,
+            ))
+        entry = result["results"][0]
+        self.assertEqual(entry.get("profile"), "free")
+
+    @patch("run_agent.AIAgent")
+    def test_profile_is_none_without_profile(self, mock_agent):
+        """Without profile, the result dict should have profile=None."""
+        mock_child = MagicMock()
+        mock_child.model = "claude-sonnet-4-6"
+        mock_child.session_prompt_tokens = 0
+        mock_child.session_completion_tokens = 0
+        mock_child.run_conversation.return_value = {
+            "final_response": "done", "completed": True, "interrupted": False,
+            "api_calls": 1, "messages": [],
+        }
+        mock_agent.return_value = mock_child
+
+        parent = _make_mock_parent()
+        result = json.loads(delegate_task(
+            goal="No profile check", parent_agent=parent,
+        ))
+        entry = result["results"][0]
+        self.assertIsNone(entry.get("profile"))
+
+    # ── Toolset bounding ──────────────────────────────────────────────────
+
+    def test_profile_no_extra_tools(self):
+        """With a profile, the child must not gain tools the parent lacks.
+
+        Verifies that _build_child_agent() with profile set does not skip
+        the parent's toolset-bounding logic.
+        """
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "file"]
+
+        with patch("run_agent.AIAgent") as MockAgent, \
+             patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+            mock_resolve.return_value = {
+                "provider": "nous",
+                "model": "poolside/laguna-s-2.1:free",
+            }
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Bounded tools",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                profile="free",
+            )
+        _, kwargs = MockAgent.call_args
+        # The child must NOT have tools the parent lacks
+        self.assertIn("terminal", kwargs.get("enabled_toolsets", []))
+        self.assertIn("file", kwargs.get("enabled_toolsets", []))
+        # Blocked tools (delegation, clarify, memory) must NOT appear in
+        # enabled_toolsets — the parent doesn't have them either.
+        for blocked in ("delegation", "clarify", "memory"):
+            self.assertNotIn(blocked, kwargs.get("enabled_toolsets", []))
+
+    # ── No regression ─────────────────────────────────────────────────────
+
+    @patch("run_agent.AIAgent")
+    def test_no_regression_without_profile(self, mock_agent):
+        """Existing behavior without profile must be unchanged."""
+        mock_child = MagicMock()
+        mock_child.model = "claude-sonnet-4-6"
+        mock_child.session_prompt_tokens = 0
+        mock_child.session_completion_tokens = 0
+        mock_child.run_conversation.return_value = {
+            "final_response": "ok", "completed": True, "interrupted": False,
+            "api_calls": 1, "messages": [],
+        }
+        mock_agent.return_value = mock_child
+
+        parent = _make_mock_parent()
+        # This exact call pattern exists in test_single_task_mode — must still work
+        result = json.loads(delegate_task(goal="Regression check", parent_agent=parent))
+        self.assertIn("results", result)
+        self.assertEqual(result["results"][0]["status"], "completed")
+
+    # ── Context isolation & Batch validation contract tests ───────────────────
+
+    @patch("run_agent.AIAgent")
+    def test_validation_rejects_invalid_profile_in_tasks_batch(self, mock_agent):
+        """delegate_task must reject invalid profile names in task batch elements."""
+        mock_agent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        tasks = [
+            {"goal": "Task A", "profile": "zoe"},
+            {"goal": "Task B", "profile": "../../invalid"},
+        ]
+        with patch("pathlib.Path.is_dir", return_value=True):
+            result = json.loads(delegate_task(tasks=tasks, parent_agent=parent))
+        self.assertIn("error", result)
+        self.assertIn("invalid profile", result["error"].lower())
+
+    @patch("run_agent.AIAgent")
+    @patch("pathlib.Path.is_dir", return_value=False)
+    def test_validation_rejects_nonexistent_profile_in_tasks_batch(self, mock_isdir, mock_agent):
+        """delegate_task must reject nonexistent profile names in task batch elements."""
+        mock_agent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        tasks = [
+            {"goal": "Task A", "profile": "ghost"},
+        ]
+        result = json.loads(delegate_task(tasks=tasks, parent_agent=parent))
+        self.assertIn("error", result)
+        self.assertIn("does not exist", result["error"].lower())
+
+    @patch("run_agent.AIAgent")
+    @patch("pathlib.Path.is_dir", return_value=True)
+    def test_profile_in_error_result(self, mock_isdir, mock_agent):
+        """When child fails, the result dict should contain the profile name."""
+        mock_child = MagicMock()
+        mock_child.model = "claude-sonnet"
+        mock_child._delegate_profile = "error-profile"
+        mock_child.run_conversation.side_effect = Exception("Injected failure")
+        mock_agent.return_value = mock_child
+
+        parent = _make_mock_parent()
+        with patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+            mock_resolve.return_value = {
+                "provider": "nous", "model": "poolside/laguna-s-2.1:free",
+                "base_url": "https://inference-api.nousresearch.com/v1",
+                "api_key": "sk-test",
+            }
+            result = json.loads(delegate_task(
+                goal="Check profile metadata", profile="error-profile", parent_agent=parent,
+            ))
+        entry = result["results"][0]
+        self.assertEqual(entry.get("status"), "error")
+        self.assertEqual(entry.get("profile"), "error-profile")
+
+    @patch("run_agent.AIAgent")
+    @patch("pathlib.Path.is_dir", return_value=True)
+    def test_profile_in_timeout_result(self, mock_isdir, mock_agent):
+        """When child timeouts, the result dict should contain the profile name."""
+        mock_child = MagicMock()
+        mock_child.model = "claude-sonnet"
+        mock_child._delegate_profile = "timeout-profile"
+        def slow_run(*args, **kwargs):
+            time.sleep(2.0)
+            return {"completed": True}
+        mock_child.run_conversation.side_effect = slow_run
+        mock_agent.return_value = mock_child
+
+        parent = _make_mock_parent()
+        with patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+            mock_resolve.return_value = {
+                "provider": "nous", "model": "poolside/laguna-s-2.1:free",
+                "base_url": "https://inference-api.nousresearch.com/v1",
+                "api_key": "sk-test",
+            }
+            with patch("tools.delegate_tool._get_child_timeout", return_value=0.1):
+                result = json.loads(delegate_task(
+                    goal="Check profile metadata", profile="timeout-profile", parent_agent=parent,
+                ))
+        entry = result["results"][0]
+        self.assertEqual(entry.get("status"), "timeout")
+        self.assertEqual(entry.get("profile"), "timeout-profile")
+
+    def test_context_local_isolation_and_soul_loading(self):
+        """Verify context-local HERMES_HOME override, secret scope loading, and SOUL.md resolution."""
+        import tempfile
+        import run_agent
+        from pathlib import Path
+
+        orig_env = os.environ.get("HERMES_HOME")
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                os.environ["HERMES_HOME"] = str(tmp_path)
+
+                zoe_dir = tmp_path / "profiles" / "zoe"
+                zoe_dir.mkdir(parents=True, exist_ok=True)
+
+                config_content = (
+                    "model:\n"
+                    "  default: 'poolside/laguna-s-2.1:free'\n"
+                    "  provider: 'nous'\n"
+                    "  base_url: 'https://inference-api.nousresearch.com/v1'\n"
+                )
+                (zoe_dir / "config.yaml").write_text(config_content, encoding="utf-8")
+
+                env_content = "HERMES_INFERENCE_API_KEY=sk-zoe-secret-key-12345\n"
+                (zoe_dir / ".env").write_text(env_content, encoding="utf-8")
+
+                soul_content = "I am Zoe, the creative subagent."
+                (zoe_dir / "SOUL.md").write_text(soul_content, encoding="utf-8")
+
+                from hermes_constants import get_hermes_home
+                from agent.secret_scope import get_secret
+
+                captured_home = []
+                captured_secret = []
+                captured_soul = []
+                captured_soul_flag = []
+
+                def mock_init(agent_self, *args, **kwargs):
+                    captured_home.append(get_hermes_home())
+                    captured_secret.append(get_secret("HERMES_INFERENCE_API_KEY"))
+                    from agent.prompt_builder import load_soul_md
+                    captured_soul.append(load_soul_md())
+                    captured_soul_flag.append(kwargs.get("load_soul_identity"))
+                    # Set up fields to avoid AttributeError in delegate_tool without triggering real provider setup
+                    agent_self.session_id = "mock-session-id"
+                    agent_self.model = kwargs.get("model", "mock-model")
+                    agent_self.provider = kwargs.get("provider", "mock-provider")
+                    agent_self.base_url = kwargs.get("base_url", None)
+                    agent_self.api_mode = kwargs.get("api_mode", None)
+                    agent_self.acp_command = kwargs.get("acp_command", None)
+                    agent_self.acp_args = kwargs.get("acp_args", [])
+                    agent_self.max_tokens = kwargs.get("max_tokens", None)
+                    agent_self.request_overrides = kwargs.get("request_overrides", {})
+                    agent_self.enabled_toolsets = kwargs.get("enabled_toolsets", [])
+
+                parent = _make_mock_parent()
+                parent.model = "parent-model"
+                parent.provider = "parent-provider"
+
+                captured_thread_home = []
+                captured_thread_secret = []
+                def mock_run_conversation(agent_self, user_message, task_id, stream_callback):
+                    captured_thread_home.append(get_hermes_home())
+                    captured_thread_secret.append(get_secret("HERMES_INFERENCE_API_KEY"))
+                    return {
+                        "final_response": "I am Zoe", "completed": True, "interrupted": False,
+                        "api_calls": 1, "messages": [],
+                    }
+
+                # Provider resolution is mocked so the test does not depend on
+                # the machine being logged into Nous Portal — everything else
+                # (config.yaml parsing, home/secret scopes, SOUL.md) runs for real.
+                with patch("run_agent.AIAgent.__init__", mock_init), \
+                     patch("run_agent.AIAgent.run_conversation", mock_run_conversation), \
+                     patch("hermes_cli.runtime_provider.resolve_runtime_provider") as mock_rtp:
+                    mock_rtp.return_value = {
+                        "provider": "nous",
+                        "base_url": "https://inference-api.nousresearch.com/v1",
+                        "api_key": "sk-zoe-secret-key-12345",
+                        "api_mode": "chat_completions",
+                    }
+                    result = json.loads(delegate_task(
+                        goal="test", profile="zoe", parent_agent=parent,
+                    ))
+
+                self.assertEqual(result["results"][0]["status"], "completed")
+                self.assertEqual(result["results"][0]["profile"], "zoe")
+
+                self.assertEqual(len(captured_home), 1)
+                self.assertEqual(captured_home[0], zoe_dir)
+                self.assertEqual(captured_secret[0], "sk-zoe-secret-key-12345")
+                self.assertEqual(captured_soul[0], "I am Zoe, the creative subagent.")
+                # Production contract: the flag that makes system_prompt.py
+                # actually inject SOUL.md must reach the child constructor.
+                self.assertEqual(captured_soul_flag, [True])
+
+                self.assertEqual(len(captured_thread_home), 1)
+                self.assertEqual(captured_thread_home[0], zoe_dir)
+                self.assertEqual(captured_thread_secret[0], "sk-zoe-secret-key-12345")
+
+                self.assertEqual(get_hermes_home(), tmp_path)
+                self.assertIsNone(get_secret("HERMES_INFERENCE_API_KEY"))
+        finally:
+            if orig_env is not None:
+                os.environ["HERMES_HOME"] = orig_env
+            else:
+                os.environ.pop("HERMES_HOME", None)
+
+    def test_profile_neutralizes_parent_acp(self):
+        """Parent ACP + profile: the child must NOT inherit the parent's ACP
+        transport (direct API only), and the profile's provider:model
+        credentials must be the ones applied — not the parent's copilot-acp
+        routing."""
+        parent = _make_mock_parent(depth=0)
+        parent.acp_command = "/usr/bin/copilot-agent"
+        parent.acp_args = ["--stdio"]
+        parent.provider = "copilot-acp"
+
+        with patch("run_agent.AIAgent") as MockAgent, \
+             patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+            mock_resolve.return_value = {
+                "provider": "nous",
+                "model": "poolside/laguna-s-2.1:free",
+                "base_url": "https://inference-api.nousresearch.com/v1",
+                "api_key": "sk-test",
+            }
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Neutralize ACP",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                profile="free",
+            )
+        _, kwargs = MockAgent.call_args
+        # Transport: no ACP leak from the parent.
+        self.assertIsNone(kwargs.get("acp_command"))
+        self.assertEqual(kwargs.get("acp_args"), [])
+        # Routing: the profile's credentials win — the provider must NOT be
+        # forced back onto the parent's copilot-acp transport.
+        self.assertEqual(kwargs.get("provider"), "nous")
+        self.assertEqual(kwargs.get("model"), "poolside/laguna-s-2.1:free")
+        self.assertEqual(
+            kwargs.get("base_url"), "https://inference-api.nousresearch.com/v1"
+        )
+        self.assertEqual(kwargs.get("api_key"), "sk-test")
+
+    def test_profile_neutralizes_delegation_acp_command_override(self):
+        """Profile + delegation config command: even an explicit
+        delegation.command must not force a profile-routed child onto the ACP
+        transport — the profile's credential routing wins over the delegation
+        config (profile > delegation config > parent inheritance), so the
+        provider must NOT be rewritten to copilot-acp."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent, \
+             patch("shutil.which", return_value="/usr/local/bin/copilot"), \
+             patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+            mock_resolve.return_value = {
+                "provider": "nous",
+                "model": "poolside/laguna-s-2.1:free",
+                "api_key": "sk-test",
+            }
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Profile beats config command",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                profile="free",
+                override_acp_command="copilot",
+                override_acp_args=["--foo"],
+            )
+        _, kwargs = MockAgent.call_args
+        self.assertIsNone(kwargs.get("acp_command"))
+        self.assertEqual(kwargs.get("acp_args"), [])
+        self.assertEqual(kwargs.get("provider"), "nous")
+        self.assertEqual(kwargs.get("model"), "poolside/laguna-s-2.1:free")
+
+    # ── Soul identity (production path) ───────────────────────────────────
+
+    def test_profile_enables_soul_identity(self):
+        """A profile-routed child must be built with load_soul_identity=True so
+        its profile's SOUL.md is loaded as identity even though project context
+        files are skipped. Without the flag, SOUL.md is never injected in
+        production (agent/system_prompt.py gates on agent.load_soul_identity)."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent, \
+             patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+            mock_resolve.return_value = {"provider": "nous", "model": "m"}
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="soul identity",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                profile="free",
+            )
+        _, kwargs = MockAgent.call_args
+        self.assertTrue(kwargs.get("load_soul_identity"))
+        self.assertTrue(kwargs.get("skip_context_files"))
+
+    def test_no_profile_leaves_soul_identity_off(self):
+        """Without a profile, load_soul_identity must stay off — the parent's
+        subagent behavior is unchanged."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="no soul identity",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+        _, kwargs = MockAgent.call_args
+        self.assertFalse(kwargs.get("load_soul_identity"))
+
+    # ── Fail-closed profile isolation ─────────────────────────────────────
+
+    @patch("run_agent.AIAgent")
+    @patch("pathlib.Path.is_dir", return_value=True)
+    def test_profile_resolution_failure_is_fail_closed(self, mock_isdir, mock_agent):
+        """If profile resolution fails, the child must NOT run with parent
+        credentials: the build aborts and the task surfaces an error entry."""
+        parent = _make_mock_parent()
+
+        with patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+            mock_resolve.side_effect = ValueError("no model.provider in config.yaml")
+            result = json.loads(delegate_task(
+                goal="broken profile", profile="broken", parent_agent=parent,
+            ))
+        entry = result["results"][0]
+        self.assertEqual(entry.get("status"), "error")
+        self.assertEqual(entry.get("profile"), "broken")
+        self.assertIn("Cannot build subagent", entry.get("error", ""))
+        # Fail-closed proof: no child agent was ever constructed.
+        mock_agent.assert_not_called()
+
+    @patch("run_agent.AIAgent")
+    @patch("pathlib.Path.is_dir", return_value=True)
+    def test_profile_scope_failure_is_fail_closed_at_build(self, mock_isdir, mock_agent):
+        """If the profile's home/secret scope cannot be installed at build
+        time, the child must NOT be constructed with the parent's context."""
+        parent = _make_mock_parent()
+
+        with patch("tools.delegate_tool._resolve_profile_config") as mock_resolve, \
+             patch("agent.secret_scope.build_profile_secret_scope",
+                   side_effect=Exception("scope boom")):
+            mock_resolve.return_value = {"provider": "nous", "model": "m"}
+            result = json.loads(delegate_task(
+                goal="scope failure", profile="zoe", parent_agent=parent,
+            ))
+        entry = result["results"][0]
+        self.assertEqual(entry.get("status"), "error")
+        self.assertEqual(entry.get("profile"), "zoe")
+        self.assertIn("Cannot isolate subagent context", entry.get("error", ""))
+        mock_agent.assert_not_called()
+
+    def test_profile_scope_failure_is_fail_closed_at_run(self):
+        """If the profile scope cannot be installed in the worker thread, the
+        child must NOT run with the parent's context: per-task error result,
+        and run_conversation is never reached."""
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        child._delegate_profile = "zoe"
+        child._delegate_role = "leaf"
+        child.tool_progress_callback = None
+        child._credential_pool = None
+
+        with patch("agent.secret_scope.build_profile_secret_scope",
+                   side_effect=Exception("scope boom")):
+            entry = _run_single_child(
+                0, "run scope failure", child=child, parent_agent=parent,
+            )
+
+        self.assertEqual(entry.get("status"), "error")
+        self.assertEqual(entry.get("profile"), "zoe")
+        self.assertIn("Cannot isolate subagent context", entry.get("error", ""))
+        child.run_conversation.assert_not_called()
+
+    @patch("run_agent.AIAgent")
+    @patch("pathlib.Path.is_dir", return_value=True)
+    def test_profile_scope_failure_restores_home_at_build(self, mock_isdir, mock_agent):
+        """If build_profile_secret_scope fails during child build after home_token is set,
+        the home token must be restored and RuntimeError raised (fail-closed)."""
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+        parent = _make_mock_parent()
+
+        with patch("hermes_constants.set_hermes_home_override", wraps=set_hermes_home_override) as mock_set_home, \
+             patch("hermes_constants.reset_hermes_home_override", wraps=reset_hermes_home_override) as mock_reset_home, \
+             patch("agent.secret_scope.build_profile_secret_scope", side_effect=ValueError("Mock env error")), \
+             patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+
+            mock_resolve.return_value = {
+                "provider": "nous", "model": "poolside/laguna-s-2.1:free",
+                "base_url": "https://inference-api.nousresearch.com/v1",
+                "api_key": "sk-test",
+            }
+
+            with self.assertRaises(RuntimeError) as ctx:
+                _build_child_agent(
+                    task_index=0,
+                    goal="Test scope build error",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                    profile="free",
+                )
+
+            self.assertIn("Cannot isolate subagent context", str(ctx.exception))
+            mock_set_home.assert_called_once()
+            self.assertEqual(mock_reset_home.call_count, 1)
+            reset_token = mock_reset_home.call_args[0][0]
+            self.assertIsNotNone(reset_token)
+
+    @patch("run_agent.AIAgent")
+    @patch("pathlib.Path.is_dir", return_value=True)
+    def test_profile_scope_failure_restores_home_at_run(self, mock_isdir, mock_agent):
+        """If build_profile_secret_scope fails in the worker thread after home_token is set,
+        the home token must be restored and RuntimeError raised (fail-closed)."""
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+        mock_child = MagicMock()
+        mock_child.model = "claude-sonnet"
+        mock_child._delegate_profile = "error-profile"
+        mock_agent.return_value = mock_child
+
+        parent = _make_mock_parent()
+
+        with patch("hermes_constants.set_hermes_home_override", wraps=set_hermes_home_override) as mock_set_home, \
+             patch("hermes_constants.reset_hermes_home_override", wraps=reset_hermes_home_override) as mock_reset_home, \
+             patch("agent.secret_scope.build_profile_secret_scope", side_effect=ValueError("Mock worker env error")), \
+             patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+
+            mock_resolve.return_value = {
+                "provider": "nous", "model": "poolside/laguna-s-2.1:free",
+                "base_url": "https://inference-api.nousresearch.com/v1",
+                "api_key": "sk-test",
+            }
+
+            result = json.loads(delegate_task(
+                goal="Check profile metadata", profile="error-profile", parent_agent=parent,
+            ))
+
+        entry = result["results"][0]
+        self.assertEqual(entry.get("status"), "error")
+        self.assertIn("Cannot isolate subagent context", entry.get("error"))
+
+        mock_set_home.assert_called()
+        self.assertEqual(mock_reset_home.call_count, 1)
+        reset_token = mock_reset_home.call_args[0][0]
+        self.assertIsNotNone(reset_token)
+
+    def test_profile_scope_failure_restores_home_in_worker(self):
+        """Real worker path: if build_profile_secret_scope fails inside the
+        worker thread AFTER set_hermes_home_override succeeded, the home token
+        must be rolled back exactly once (leak-free fail-close).
+
+        Unlike test_profile_scope_failure_restores_home_at_run (where the
+        permanent patch makes the BUILD fail first), this drives
+        _run_single_child directly so the failure happens in the worker.
+        """
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        child._delegate_profile = "zoe"
+        child._delegate_role = "leaf"
+        child.tool_progress_callback = None
+        child._credential_pool = None
+
+        with patch("hermes_constants.set_hermes_home_override", wraps=set_hermes_home_override) as mock_set_home, \
+             patch("hermes_constants.reset_hermes_home_override", wraps=reset_hermes_home_override) as mock_reset_home, \
+             patch("agent.secret_scope.build_profile_secret_scope",
+                   side_effect=ValueError("Mock worker env error")):
+            entry = _run_single_child(
+                0, "worker scope leak check", child=child, parent_agent=parent,
+            )
+
+        self.assertEqual(entry.get("status"), "error")
+        self.assertIn("Cannot isolate subagent context", entry.get("error", ""))
+        child.run_conversation.assert_not_called()
+        mock_set_home.assert_called_once()
+        # Exactly one rollback: the partially-acquired home token, and the
+        # finally block must NOT double-reset an already-consumed token.
+        self.assertEqual(mock_reset_home.call_count, 1)
+        self.assertIsNotNone(mock_reset_home.call_args[0][0])
+
+    def test_run_error_not_rewrapped_as_isolation_error(self):
+        """A failure inside run_conversation must surface with its ORIGINAL
+        message — only scope-installation failures may be re-labeled as
+        'Cannot isolate subagent context' (the scope try/except must not
+        swallow run errors)."""
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        child._delegate_profile = "zoe"
+        child._delegate_role = "leaf"
+        child.tool_progress_callback = None
+        child._credential_pool = None
+        child.run_conversation.side_effect = Exception("boom-run-original")
+
+        entry = _run_single_child(
+            0, "run error labeling", child=child, parent_agent=parent,
+        )
+
+        self.assertEqual(entry.get("status"), "error")
+        self.assertIn("boom-run-original", entry.get("error", ""))
+        self.assertNotIn("Cannot isolate subagent context", entry.get("error", ""))
+
+
+    # ── Targeted tests for recent fixes ────────────────────────────────────
+
+    def test_registry_record_contains_profile(self):
+        """_register_subagent records must carry the profile field."""
+        from tools.delegate_tool import _register_subagent, _active_subagents
+
+        with patch("tools.delegate_tool._active_subagents_lock"):
+            test_id = "sa-test-registry-profile"
+            _register_subagent({
+                "subagent_id": test_id,
+                "profile": "zoe",
+                "agent": MagicMock(),
+            })
+            record = _active_subagents.get(test_id)
+            self.assertIsNotNone(record)
+            self.assertEqual(record.get("profile"), "zoe")
+            # Cleanup
+            _active_subagents.pop(test_id, None)
+
+    def test_schema_description_mentions_default_profile(self):
+        """The profile parameter description must mention the 'default' profile."""
+        desc = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["profile"]["description"]
+        self.assertIn("default", desc)
+        self.assertIn("~/.hermes/profiles/", desc)
+        self.assertIn("invalid", desc.lower())
+        self.assertIn("reserved", desc.lower())
+
+    def test_no_profile_used_attribute_remains(self):
+        """No reference to the old _profile_used attribute should exist in delegate_tool code."""
+        source_path = os.path.join(os.path.dirname(__file__), "..", "..", "tools", "delegate_tool.py")
+        source = open(source_path).read()
+        self.assertNotIn("_profile_used", source)
+
+    def test_registry_handler_forwards_profile(self):
+        """The registry-registered handler must pass profile= to delegate_task."""
+        import inspect as _inspect
+        from tools.delegate_tool import registry
+
+        # Find the handler registered for delegate_task
+        entry = registry._tools.get("delegate_task")
+        self.assertIsNotNone(entry, "delegate_task not found in registry")
+        handler = getattr(entry, "handler", None)
+        self.assertIsNotNone(handler, "handler not found in registry entry")
+
+        # Inspect the handler source — it must mention profile=
+        handler_src = _inspect.getsource(handler)
+        self.assertIn("profile=args.get", handler_src,
+                      "Registry handler must forward profile=args.get('profile')")
+
+    def test_profile_secret_scope_failure_is_fail_closed(self):
+        """_resolve_profile_config must raise when profile secrets cannot load."""
+        from tools.delegate_tool import _resolve_profile_config
+
+        with patch("agent.secret_scope.build_profile_secret_scope",
+                   side_effect=PermissionError("no access")), \
+             patch("pathlib.Path.is_dir", return_value=True), \
+             patch("hermes_cli.profiles.get_profile_dir") as mock_dir, \
+             patch("hermes_cli.config.load_config") as mock_cfg:
+            mock_dir.return_value = Path("/tmp/fake-profile")
+            mock_cfg.return_value = {}
+
+            with self.assertRaises(ValueError) as ctx:
+                _resolve_profile_config("zoe")
+
+            self.assertIn("secret scope", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":
