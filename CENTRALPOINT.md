@@ -9,10 +9,28 @@ jamais consignés.
 
 ## 3. Work in Progress
 
-- Aucun travail d'écriture actif. La validation E2E du routage par profil est
-  terminée sur `feat/delegate-task-profile`.
+- ADR-0001 (proposé) : routeur prompt→modèle comme module du futur package
+  `hermes-delegate`, opéré aux frontières de délégation (spawn-time), zéro
+  footprint core. Fichier : `docs/adr/0001-prompt-model-router-in-hermes-delegate.md`.
+  En attente de validation avant implémentation.
 
 ## 5. Journal de Dialogue
+
+### 2026-08-03 — Codex — ADR-0001 : routeur prompt→modèle dans hermes-delegate
+
+- Demande : « avoir la perspective dans l'ADR de construire cet outil en module
+  intégré au futur package hermes-delegate ».
+- Constat code : `smart_model_routing` est une clé réservée mais morte
+  (`config.py:5739`, setup écrit `enabled: False` à `setup.py:3094`) ; aucun
+  moteur n'existe. `agent/auxiliary_client.py::_resolve_auto` fournit déjà la
+  chaîne de résolution provider→modèle à réutiliser.
+- Décision consignée : module `hermes_delegate.model_router`, routage au
+  spawn-time des sous-agents (cache-safe par construction — contexte frais),
+  heuristiques d'abord + classifieur LLM cheap optionnel et caché ; bridge
+  main-loop différé derrière un hook plugin générique élargi (jamais de modif
+  core).
+- Fichiers : `docs/adr/0001-prompt-model-router-in-hermes-delegate.md` (créé),
+  ce `CENTRALPOINT.md` (journal).
 
 ### 2026-07-31 16:05 CEST — Codex — Validation E2E avec un profil réel
 
