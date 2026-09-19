@@ -382,20 +382,66 @@ def _build_children(
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
+        task_overrides = dict(overrides)
+        task_model = creds["model"]
+        routed_reasoning_config = None
+        # Validated per-task images; absent on image-less tasks, which keep the text-only goal turn.
+        _t_images = task_images[i] if task_images and i < len(task_images) else None
+        try:
+            from hermes_router.state import is_enabled
+            if is_enabled():
+                from hermes_router.classifier import classify
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                from hermes_constants import parse_reasoning_effort
+
+                c_res = classify(t["goal"], images=_t_images)
+                task_model = c_res.get("model") or task_model
+                c_provider = c_res.get("provider", "nous")
+                rt = resolve_runtime_provider(requested=c_provider, target_model=task_model)
+                if rt and rt.get("api_key"):
+                    task_overrides["override_provider"] = rt.get("provider")
+                    task_overrides["override_base_url"] = rt.get("base_url")
+                    task_overrides["override_api_key"] = rt.get("api_key")
+                    task_overrides["override_api_mode"] = rt.get("api_mode")
+
+                reasoning = c_res.get("reasoning")
+                if reasoning:
+                    routed_reasoning_config = parse_reasoning_effort(reasoning)
+                    ro = dict(task_overrides.get("override_request_overrides") or {})
+                    extra = dict(ro.get("extra_body") or {})
+                    if reasoning == "none":
+                        extra["reasoning"] = {"effort": "none"}
+                        extra["reasoning_effort"] = "none"
+                    else:
+                        extra["reasoning"] = {"effort": reasoning}
+                        extra["reasoning_effort"] = reasoning
+                    ro["extra_body"] = extra
+                    task_overrides["override_request_overrides"] = ro
+
+                logger.info(
+                    "[router] Subagent %d routed to %s (%s) tier=%s cap=%s reasoning=%s (source: %s, latency: %dms)",
+                    i, task_model, c_provider, c_res.get("tier"), c_res.get("capability", "text"), reasoning,
+                    c_res.get("source"), c_res.get("latency_ms", 0)
+                )
+        except Exception as _router_err:
+            logger.debug("hermes_router subagent hook bypass: %s", _router_err)
+
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                model=task_model, max_iterations=max_iterations, task_count=len(task_list),
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **task_overrides,
             )
+            if routed_reasoning_config is not None:
+                child.reasoning_config = routed_reasoning_config
+                if hasattr(child, "_session_init_model_config") and isinstance(child._session_init_model_config, dict):
+                    child._session_init_model_config["reasoning_config"] = routed_reasoning_config
         except ValueError as exc:
             return [], str(exc)
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
-        # Validated per-task images; absent on image-less tasks, which keep the text-only goal turn.
-        _t_images = task_images[i] if task_images and i < len(task_images) else None
         if _t_images:
             with _quiet("Could not attach images to child %d", i):
                 child._delegate_images = _t_images
