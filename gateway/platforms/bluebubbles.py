@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
@@ -131,6 +132,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        # FIX#2 local — echo suppression: BlueBubbles v1.9.9 re-dispatche les events webhook
+        # des messages envoyés par ce Mac (isFromMe absent/false), donc le filtre isFromMe
+        # ne les attrape pas et le gateway répond à ses propres messages.
+        self._sent_echo_cache: OrderedDict[str, float] = OrderedDict()
+        self._echo_window = 90.0  # seconds
 
     # --- API helpers ---
 
@@ -251,12 +257,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
     @property
     def _webhook_url(self) -> str:
-        """External webhook URL for BlueBubbles registration (local binds → localhost). In
+        """External webhook URL for BlueBubbles registration (local binds → 127.0.0.1 IPv4). In
         shared-listener mode it is the default listener's ``/p/<profile>/`` URL."""
         shared = getattr(self, "_shared_ingress_url", None)
         if shared:
             return shared
-        host = "localhost" if self.webhook_host in _LOCAL_HOSTS else self.webhook_host
+        # FIX#1 local — l'URL enregistrée chez BlueBubbles doit être l'IPv4 littérale :
+        # `localhost` résout en ::1 sur macOS alors que le listener est 127.0.0.1
+        # (symptôme : connect ECONNREFUSED ::1:8645 côté BlueBubbles Server).
+        host = "127.0.0.1" if self.webhook_host in _LOCAL_HOSTS else self.webhook_host
         return f"http://{host}:{self.webhook_port}{self.webhook_path}"
 
     def _webhook_register_url_with(self, password_param: str) -> str:
@@ -359,6 +368,26 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         # Base splitter minus "(1/3)" pagination suffixes — iMessage bubbles flow naturally.
         return [_PAGINATION_SUFFIX_RE.sub("", c) for c in BasePlatformAdapter.truncate_message(content, max_length)]
 
+    def _record_sent_echo(self, text: str) -> None:
+        """FIX#2 local — retient un chunk sortant pour pouvoir jeter son écho webhook."""
+        self._sent_echo_cache[text] = time.monotonic()
+        self._sent_echo_cache.move_to_end(text)
+        while len(self._sent_echo_cache) > 128:
+            self._sent_echo_cache.popitem(last=False)
+
+    def _is_recent_outbound_echo(self, text: str) -> bool:
+        """FIX#2 local — True si *text* correspond à un envoi récent (fenêtre 90 s)."""
+        now = time.monotonic()
+        norm = " ".join(text.split())
+        for sent, ts in list(self._sent_echo_cache.items()):
+            if now - ts > self._echo_window:
+                self._sent_echo_cache.pop(sent, None)
+                continue
+            if " ".join(sent.split()) == norm:
+                logger.info("[bluebubbles] suppressed outbound echo (sent %.0fs ago)", now - ts)
+                return True
+        return False
+
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         text = self.format_message(content)
@@ -380,6 +409,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 payload.update(method="private-api", selectedMessageGuid=reply_to, partIndex=0)
             if not (last := await self._post_message("/api/v1/message/text", payload)).success:
                 return last
+            self._record_sent_echo(chunk)
         return last
 
     # --- Media sending (outbound) ---
@@ -579,6 +609,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if isinstance(assoc_type, int) and assoc_type in _TAPBACK_CODES:  # tapback reactions delivered as messages
             return _ok()
         text = self._value(record.get("text"), record.get("message"), record.get("body")) or ""
+        # FIX#2 local — placé APRÈS la définition de `text` (l'ordre inverse a déjà causé un
+        # UnboundLocalError → HTTP 500 sur tout message entrant). Ne pas remonter ce bloc.
+        if text and self._is_recent_outbound_echo(text):
+            return _ok()
         chat_guid, chat_identifier, sender = self._resolve_chat_and_sender(payload, record)
         session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
