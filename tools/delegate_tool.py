@@ -1267,6 +1267,10 @@ def _build_child_agent(
     # its credentials (provider, model, api_key, base_url) beat both the
     # delegation config and parent inheritance. This lets users route a
     # subagent to an entirely different provider:model pair by profile name.
+    # Resolution intentionally happens during child construction, before the
+    # worker starts. The worker reinstalls the profile context separately in
+    # `_run_with_thread_capture`; keeping this boundary explicit prevents
+    # credential reads from depending on mutable parent-thread state.
     if profile:
         try:
             _profile_creds = _resolve_profile_config(profile)
@@ -1376,11 +1380,17 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
-    # Inherit the parent's fallback provider chain so subagents can recover
-    # from rate-limits and credential exhaustion exactly like the top-level
-    # agent does.  _fallback_chain is a list accepted by AIAgent's
-    # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    # Inherit the parent's fallback provider chain only for unprofiled
+    # children. A named profile is an isolated provider/model boundary:
+    # allowing the parent's chain here could silently route a `free` child
+    # to an unrelated paid provider after a rate-limit or credential error.
+    # _fallback_chain is a list accepted by AIAgent's fallback_model
+    # parameter (which handles both list and dict forms).
+    parent_fallback = (
+        None
+        if profile
+        else (getattr(parent_agent, "_fallback_chain", None) or None)
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1504,7 +1514,11 @@ def _build_child_agent(
                 iteration_budget=None,  # fresh budget per subagent
                 **child_optional_kwargs,
             )
-            child._delegate_profile = profile
+        # Profile identity is metadata used by every result path. Keep this
+        # dynamic attribute for the local extension; AIAgent remains API-stable.
+        # If AIAgent gains __slots__, promote this to an explicit constructor
+        # field before upstreaming.
+        child._delegate_profile = profile  # type: ignore[reportAttributeAccessIssue]
     finally:
         # Construction errors propagate with their original message (only
         # scope-installation failures are re-labeled, in the dedicated scope

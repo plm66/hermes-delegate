@@ -3258,6 +3258,35 @@ class TestFallbackModelInheritance(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
 
+    def test_profile_child_does_not_inherit_parent_fallback_chain(self):
+        """A named profile must remain isolated from the parent's fallback chain."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {"provider": "openrouter", "model": "claude-opus-5", "api_key": "sk-or-x"}
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent, \
+             patch("tools.delegate_tool._resolve_profile_config") as mock_resolve:
+            mock_resolve.return_value = {
+                "provider": "nous",
+                "model": "poolside/laguna-s-2.1:free",
+            }
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test profile fallback isolation",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                profile="free",
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertIsNone(kwargs["fallback_model"])
+
 
 class TestProfileParam(unittest.TestCase):
     """TDD: RED tests for the `profile` parameter on delegate_task.
